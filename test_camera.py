@@ -56,6 +56,7 @@ def test_d435i():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
             stacked = np.hstack((color_image, depth_colormap))
+            stacked = cv2.resize(stacked, (stacked.shape[1] * 3, stacked.shape[0] * 3))
             cv2.imshow("D435i Test — Color | Depth (press q to quit)", stacked)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
