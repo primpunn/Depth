@@ -28,7 +28,10 @@ def test_d435i():
     align = rs.align(rs.stream.color)
     colorizer = rs.colorizer()
 
-    print("\nStreaming... Press 'q' to quit.")
+    print("\nWarming up camera (30 frames)...")
+    for _ in range(30):
+        pipeline.wait_for_frames()
+    print("Streaming... Press 'q' to quit.")
 
     try:
         while True:
