@@ -28,10 +28,14 @@ def test_d435i():
     align = rs.align(rs.stream.color)
     colorizer = rs.colorizer()
 
-    print("\nWarming up camera (30 frames)...")
-    for _ in range(30):
+    print("\nWarming up camera (60 frames)...")
+    for _ in range(60):
         pipeline.wait_for_frames()
     print("Streaming... Press 'q' to quit.")
+
+    win_name = "D435i Test — Color | Depth (press q to quit)"
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win_name, 1920, 480)
 
     try:
         while True:
@@ -47,6 +51,8 @@ def test_d435i():
             color_image = np.asanyarray(color_frame.get_data())
             depth_colormap = np.asanyarray(colorizer.colorize(depth_frame).get_data())
 
+            print(f"\rColor mean: {color_image.mean():.1f}  Depth mean: {depth_colormap.mean():.1f}", end="")
+
             # Show center pixel depth
             h, w = depth_colormap.shape[:2]
             cx, cy = w // 2, h // 2
@@ -56,8 +62,7 @@ def test_d435i():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
             stacked = np.hstack((color_image, depth_colormap))
-            stacked = cv2.resize(stacked, (stacked.shape[1] * 3, stacked.shape[0] * 3))
-            cv2.imshow("D435i Test — Color | Depth (press q to quit)", stacked)
+            cv2.imshow(win_name, stacked)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
