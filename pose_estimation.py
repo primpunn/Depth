@@ -1,7 +1,6 @@
 import pyrealsense2 as rs
 import numpy as np
 import cv2
-import threading
 from ultralytics import YOLO
 
 # COCO keypoint indices used
@@ -74,23 +73,10 @@ def run():
     model = YOLO("yolov8n-pose.pt")
 
     # --- IMU state ---
-    imu_lock = threading.Lock()
     latest_gyro = np.zeros(3)
     latest_accel = np.zeros(3)
     madgwick = MadgwickFilter(beta=0.1)
     latest_quat = np.array([1.0, 0.0, 0.0, 0.0])
-
-    def imu_callback(frame):
-        nonlocal latest_gyro, latest_accel, latest_quat
-        motion = frame.as_motion_frame()
-        data = motion.get_motion_data()
-        ts = frame.get_timestamp() / 1000.0
-        with imu_lock:
-            if frame.get_profile().stream_type() == rs.stream.gyro:
-                latest_gyro = np.array([data.x, data.y, data.z])
-            elif frame.get_profile().stream_type() == rs.stream.accel:
-                latest_accel = np.array([data.x, data.y, data.z])
-                latest_quat = madgwick.update(latest_gyro, latest_accel, ts)
 
     # --- Pipeline ---
     pipeline = rs.pipeline()
@@ -100,7 +86,7 @@ def run():
     config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f)
     config.enable_stream(rs.stream.gyro,  rs.format.motion_xyz32f)
 
-    profile = pipeline.start(config, imu_callback)
+    profile = pipeline.start(config)
     intrinsics = profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
     align = rs.align(rs.stream.color)
 
@@ -122,6 +108,18 @@ def run():
             depth_frame = aligned.get_depth_frame()
             if not color_frame or not depth_frame:
                 continue
+
+            # Poll IMU from frameset
+            accel_frame = frames.first_or_default(rs.stream.accel)
+            gyro_frame  = frames.first_or_default(rs.stream.gyro)
+            if accel_frame and accel_frame.is_motion_frame():
+                d = accel_frame.as_motion_frame().get_motion_data()
+                latest_accel = np.array([d.x, d.y, d.z])
+            if gyro_frame and gyro_frame.is_motion_frame():
+                d = gyro_frame.as_motion_frame().get_motion_data()
+                latest_gyro = np.array([d.x, d.y, d.z])
+            ts = frames.get_timestamp() / 1000.0
+            latest_quat = madgwick.update(latest_gyro, latest_accel, ts)
 
             color_image = np.asanyarray(color_frame.get_data())
             h, w = color_image.shape[:2]
@@ -174,8 +172,7 @@ def run():
                         y += 26
 
             # --- Camera quaternion from IMU ---
-            with imu_lock:
-                quat = latest_quat.copy()
+            quat = latest_quat.copy()
 
             y += 10
             cv2.putText(info_image, "--- Camera Quaternion ---", (10, y),
