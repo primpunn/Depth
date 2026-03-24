@@ -83,10 +83,19 @@ def run():
     config = rs.config()
     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
     config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-    config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f)
-    config.enable_stream(rs.stream.gyro,  rs.format.motion_xyz32f)
+    config.enable_stream(rs.stream.accel)
+    config.enable_stream(rs.stream.gyro)
 
-    profile = pipeline.start(config)
+    imu_enabled = True
+    try:
+        profile = pipeline.start(config)
+    except RuntimeError:
+        print("Warning: IMU streams unavailable, restarting without IMU.")
+        imu_enabled = False
+        config = rs.config()
+        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        profile = pipeline.start(config)
     intrinsics = profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
     align = rs.align(rs.stream.color)
 
@@ -110,16 +119,17 @@ def run():
                 continue
 
             # Poll IMU from frameset
-            accel_frame = frames.first_or_default(rs.stream.accel)
-            gyro_frame  = frames.first_or_default(rs.stream.gyro)
-            if accel_frame and accel_frame.is_motion_frame():
-                d = accel_frame.as_motion_frame().get_motion_data()
-                latest_accel = np.array([d.x, d.y, d.z])
-            if gyro_frame and gyro_frame.is_motion_frame():
-                d = gyro_frame.as_motion_frame().get_motion_data()
-                latest_gyro = np.array([d.x, d.y, d.z])
-            ts = frames.get_timestamp() / 1000.0
-            latest_quat = madgwick.update(latest_gyro, latest_accel, ts)
+            if imu_enabled:
+                accel_frame = frames.first_or_default(rs.stream.accel)
+                gyro_frame  = frames.first_or_default(rs.stream.gyro)
+                if accel_frame and accel_frame.is_motion_frame():
+                    d = accel_frame.as_motion_frame().get_motion_data()
+                    latest_accel = np.array([d.x, d.y, d.z])
+                if gyro_frame and gyro_frame.is_motion_frame():
+                    d = gyro_frame.as_motion_frame().get_motion_data()
+                    latest_gyro = np.array([d.x, d.y, d.z])
+                ts = frames.get_timestamp() / 1000.0
+                latest_quat = madgwick.update(latest_gyro, latest_accel, ts)
 
             color_image = np.asanyarray(color_frame.get_data())
             h, w = color_image.shape[:2]
@@ -172,15 +182,18 @@ def run():
                         y += 26
 
             # --- Camera quaternion from IMU ---
-            quat = latest_quat.copy()
-
             y += 10
             cv2.putText(info_image, "--- Camera Quaternion ---", (10, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             y += 24
-            cv2.putText(info_image,
-                        f"w={quat[0]:.3f}  x={quat[1]:.3f}  y={quat[2]:.3f}  z={quat[3]:.3f}",
-                        (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (128, 255, 128), 1)
+            if imu_enabled:
+                quat = latest_quat.copy()
+                cv2.putText(info_image,
+                            f"w={quat[0]:.3f}  x={quat[1]:.3f}  y={quat[2]:.3f}  z={quat[3]:.3f}",
+                            (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (128, 255, 128), 1)
+            else:
+                cv2.putText(info_image, "IMU unavailable", (10, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 100, 255), 1)
 
             stacked = np.hstack((color_image, info_image))
             cv2.imshow(win_name, stacked)
