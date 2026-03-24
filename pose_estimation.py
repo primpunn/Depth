@@ -1,28 +1,27 @@
 import pyrealsense2 as rs
 import numpy as np
 import cv2
-import mediapipe as mp
 import threading
+from ultralytics import YOLO
 
-# MediaPipe landmark indices
-IDX_L_ELBOW  = 13
-IDX_R_ELBOW  = 14
-IDX_L_WRIST  = 15  # left hand
-IDX_R_WRIST  = 16  # right hand
+# COCO keypoint indices used
+IDX_L_ELBOW = 7
+IDX_R_ELBOW = 8
+IDX_L_WRIST = 9   # left hand
+IDX_R_WRIST = 10  # right hand
 
 
 class MadgwickFilter:
-    """Simple Madgwick AHRS filter for IMU -> quaternion fusion."""
+    """Madgwick AHRS filter: fuses gyro + accel into quaternion [w, x, y, z]."""
     def __init__(self, beta=0.1):
         self.beta = beta
-        self.q = np.array([1.0, 0.0, 0.0, 0.0])  # [w, x, y, z]
+        self.q = np.array([1.0, 0.0, 0.0, 0.0])
         self.last_ts = None
 
     def update(self, gyro, accel, ts):
         if self.last_ts is None:
             self.last_ts = ts
             return self.q.copy()
-
         dt = ts - self.last_ts
         self.last_ts = ts
         if dt <= 0:
@@ -37,7 +36,6 @@ class MadgwickFilter:
             return self.q.copy()
         ax, ay, az = ax/norm, ay/norm, az/norm
 
-        # Gradient step from accelerometer
         F = np.array([
             2*(q1*q3 - q0*q2) - ax,
             2*(q0*q1 + q2*q3) - ay,
@@ -53,7 +51,6 @@ class MadgwickFilter:
         if n > 0:
             step /= n
 
-        # Quaternion derivative from gyroscope
         qDot = 0.5 * np.array([
             -q1*gx - q2*gy - q3*gz,
              q0*gx + q2*gz - q3*gy,
@@ -73,19 +70,13 @@ def get_3d_point(depth_frame, intrinsics, px, py):
     return rs.rs2_deproject_pixel_to_point(intrinsics, [px, py], depth)
 
 
-def pixel_of(lm, w, h):
-    px = max(0, min(int(lm.x * w), w - 1))
-    py = max(0, min(int(lm.y * h), h - 1))
-    return px, py
-
-
 def run():
-    # --- IMU state (updated by callback thread) ---
+    model = YOLO("yolov8n-pose.pt")
+
+    # --- IMU state ---
     imu_lock = threading.Lock()
     latest_gyro = np.zeros(3)
     latest_accel = np.zeros(3)
-    latest_accel_ts = [0.0]
-    latest_gyro_ts = [0.0]
     madgwick = MadgwickFilter(beta=0.1)
     latest_quat = np.array([1.0, 0.0, 0.0, 0.0])
 
@@ -93,16 +84,12 @@ def run():
         nonlocal latest_gyro, latest_accel, latest_quat
         motion = frame.as_motion_frame()
         data = motion.get_motion_data()
-        ts = frame.get_timestamp() / 1000.0  # ms -> s
-
+        ts = frame.get_timestamp() / 1000.0
         with imu_lock:
             if frame.get_profile().stream_type() == rs.stream.gyro:
                 latest_gyro = np.array([data.x, data.y, data.z])
-                latest_gyro_ts[0] = ts
             elif frame.get_profile().stream_type() == rs.stream.accel:
                 latest_accel = np.array([data.x, data.y, data.z])
-                latest_accel_ts[0] = ts
-                # Update filter on every accel sample
                 latest_quat = madgwick.update(latest_gyro, latest_accel, ts)
 
     # --- Pipeline ---
@@ -116,10 +103,6 @@ def run():
     profile = pipeline.start(config, imu_callback)
     intrinsics = profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
     align = rs.align(rs.stream.color)
-
-    mp_pose = mp.solutions.pose
-    mp_draw = mp.solutions.drawing_utils
-    pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
     win_name = "Pose + IMU — D435i (press q to quit)"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
@@ -142,51 +125,55 @@ def run():
 
             color_image = np.asanyarray(color_frame.get_data())
             h, w = color_image.shape[:2]
-
-            results = pose.process(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
-
             info_image = np.zeros((480, 640, 3), dtype=np.uint8)
             y = 20
 
-            # --- Pose landmarks ---
-            if results.pose_landmarks:
-                mp_draw.draw_landmarks(color_image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-                lms = results.pose_landmarks.landmark
+            # --- YOLOv8 Pose ---
+            results = model(color_image, verbose=False)
+            if results and results[0].keypoints is not None:
+                kpts = results[0].keypoints.xy.cpu().numpy()  # shape: (N, 17, 2)
 
-                points = {}
-                for name, idx in [("L_ELBOW", IDX_L_ELBOW), ("R_ELBOW", IDX_R_ELBOW),
-                                   ("L_HAND",  IDX_L_WRIST), ("R_HAND",  IDX_R_WRIST)]:
-                    px, py = pixel_of(lms[idx], w, h)
-                    pt = get_3d_point(depth_frame, intrinsics, px, py)
-                    points[name] = (px, py, pt)
-                    cv2.circle(color_image, (px, py), 6, (0, 255, 255), -1)
+                # Annotate frame
+                color_image = results[0].plot(img=color_image)
 
-                # Midpoint of lower arm = average pixel of elbow + wrist, then deproject
-                for side, elbow_key, hand_key, mid_key in [
-                    ("L", "L_ELBOW", "L_HAND", "L_FOREARM_MID"),
-                    ("R", "R_ELBOW", "R_HAND", "R_FOREARM_MID"),
-                ]:
-                    ex, ey, _ = points[elbow_key]
-                    hx, hy, _ = points[hand_key]
-                    mx, my = (ex + hx) // 2, (ey + hy) // 2
-                    mid_pt = get_3d_point(depth_frame, intrinsics, mx, my)
-                    points[mid_key] = (mx, my, mid_pt)
-                    cv2.circle(color_image, (mx, my), 5, (255, 128, 0), -1)
+                if len(kpts) > 0:
+                    kp = kpts[0]  # first detected person
 
-                # Print all positions to info panel
-                cv2.putText(info_image, "--- Joint Positions (m) ---", (10, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                y += 24
-                for name, (px, py, pt) in points.items():
-                    if pt:
-                        label = f"{name}: ({pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f})"
-                    else:
-                        label = f"{name}: unavailable"
-                    cv2.putText(info_image, label, (10, y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-                    y += 26
+                    raw_joints = {
+                        "L_ELBOW": kp[IDX_L_ELBOW],
+                        "R_ELBOW": kp[IDX_R_ELBOW],
+                        "L_HAND":  kp[IDX_L_WRIST],
+                        "R_HAND":  kp[IDX_R_WRIST],
+                    }
 
-            # --- IMU quaternion ---
+                    # Compute forearm midpoints
+                    for side, ek, hk, mk in [
+                        ("L", "L_ELBOW", "L_HAND", "L_FOREARM_MID"),
+                        ("R", "R_ELBOW", "R_HAND", "R_FOREARM_MID"),
+                    ]:
+                        raw_joints[mk] = (raw_joints[ek] + raw_joints[hk]) / 2.0
+
+                    cv2.putText(info_image, "--- Joint Positions (m) ---", (10, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    y += 24
+
+                    for name, (px, py_) in raw_joints.items():
+                        px_i = max(0, min(int(px),  w - 1))
+                        py_i = max(0, min(int(py_), h - 1))
+
+                        pt = get_3d_point(depth_frame, intrinsics, px_i, py_i)
+                        cv2.circle(color_image, (px_i, py_i), 5, (0, 255, 255), -1)
+
+                        if pt:
+                            label = f"{name}: ({pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f})"
+                        else:
+                            label = f"{name}: depth unavailable"
+
+                        cv2.putText(info_image, label, (10, y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+                        y += 26
+
+            # --- Camera quaternion from IMU ---
             with imu_lock:
                 quat = latest_quat.copy()
 
@@ -204,7 +191,6 @@ def run():
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     finally:
-        pose.close()
         pipeline.stop()
         cv2.destroyAllWindows()
         print("Stopped.")
